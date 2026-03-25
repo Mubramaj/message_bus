@@ -398,4 +398,93 @@ describe MessageBus do
       channel.must_equal('/test')
     end
   end
+
+  describe "keepalive recovery" do
+    # Use an interval just above MIN_KEEPALIVE so the keepalive blk is queued.
+    # Tests invoke the blk directly rather than waiting for real timers.
+    KEEPALIVE_INTERVAL = 30
+
+    before do
+      @bus.configure(keepalive_interval: KEEPALIVE_INTERVAL)
+
+      # Simulate a half-open TCP connection: the subscriber thread stays alive
+      # but never receives messages, so @last_message is never refreshed after
+      # we stale it. This also prevents the keepalive publish from resetting
+      # @last_message via the real subscriber.
+      #
+      # The loop mirrors what real backends do: it runs until global_unsubscribe
+      # sets @subscribed = false, so destroy's @subscriber_thread.join completes
+      # without hanging.
+      @bus.backend_instance.define_singleton_method(:global_subscribe) do |last_id = nil, &blk|
+        @subscribed = true
+        loop { sleep 0.05; break unless @subscribed }
+      end
+      @bus.backend_instance.define_singleton_method(:global_unsubscribe) do
+        @subscribed = false
+      end
+
+      @bus.after_fork
+      wait_for(1000) { @bus.instance_variable_get(:@subscriber_thread)&.alive? }
+      # after_fork queues a no-op job (delay=0) before the keepalive blk (delay=30s).
+      # Wait until the timer thread consumes the no-op so jobs.first is the keepalive blk.
+      wait_for(1000) { @bus.timer.jobs.length == 1 }
+    end
+
+    def stale_last_message
+      # Stale by more than keepalive_interval * 3 (the timeout threshold)
+      @bus.instance_variable_set(:@last_message, Time.now - KEEPALIVE_INTERVAL * 3 - 1)
+    end
+
+    def trigger_keepalive_blk
+      # Directly invoke the scheduled keepalive proc without waiting for real time
+      _, blk = @bus.timer.jobs.first
+      blk.call
+    end
+
+    it "kills the stuck subscriber thread and creates a fresh one when keepalive times out" do
+      original_thread = @bus.instance_variable_get(:@subscriber_thread)
+      stale_last_message
+
+      trigger_keepalive_blk
+
+      # The old thread must be dead and a new, live thread must replace it
+      wait_for(2000) { !original_thread.alive? }
+      wait_for(2000) { @bus.instance_variable_get(:@subscriber_thread) != original_thread }
+
+      original_thread.alive?.must_equal false
+      new_thread = @bus.instance_variable_get(:@subscriber_thread)
+      new_thread.wont_be_nil
+      new_thread.alive?.must_equal true
+    end
+
+    it "logs a warning when keepalive times out" do
+      log_output = StringIO.new
+      @bus.configure(logger: Logger.new(log_output))
+      stale_last_message
+
+      trigger_keepalive_blk
+
+      log_output.string.must_include "timed out"
+      log_output.string.must_include "no longer functioning correctly"
+    end
+
+    it "does not kill a thread that was already replaced by concurrent recovery" do
+      original_thread = @bus.instance_variable_get(:@subscriber_thread)
+      stale_last_message
+
+      # Simulate a race: another recovery path already swapped in a new thread
+      replacement = Thread.new { sleep }
+      @bus.instance_variable_set(:@subscriber_thread, replacement)
+
+      trigger_keepalive_blk
+
+      # The replacement thread must be untouched — we must not kill the wrong thread
+      replacement.alive?.must_equal true
+      @bus.instance_variable_get(:@subscriber_thread).must_equal replacement
+
+      replacement.kill
+      # original_thread is still running the stub loop; kill it for cleanup
+      original_thread.kill
+    end
+  end
 end
