@@ -431,13 +431,16 @@ describe MessageBus do
     end
 
     def stale_last_message
-      # Stale by more than keepalive_interval * 3 (the timeout threshold)
+      # No public API to inject time; direct ivar write is intentional test setup.
+      # Stale by more than keepalive_interval * 3 (the timeout threshold).
       @bus.instance_variable_set(:@last_message, Time.now - KEEPALIVE_INTERVAL * 3 - 1)
     end
 
     def trigger_keepalive_blk
-      # Directly invoke the scheduled keepalive proc without waiting for real time
-      _, blk = @bus.timer.jobs.first
+      # Bypass real timer delay — fires the scheduled proc synchronously.
+      # We shift the job out first to mirror what TimerThread#do_work does
+      # (it calls @jobs.shift before blk.call), so job counts stay accurate.
+      _, blk = @bus.timer.instance_variable_get(:@mutex).synchronize { @bus.timer.jobs.shift }
       blk.call
     end
 
@@ -447,14 +450,20 @@ describe MessageBus do
 
       trigger_keepalive_blk
 
-      # The old thread must be dead and a new, live thread must replace it
+      # The old thread must be dead
       wait_for(2000) { !original_thread.alive? }
-      wait_for(2000) { @bus.instance_variable_get(:@subscriber_thread) != original_thread }
-
       original_thread.alive?.must_equal false
+
+      # A new, live subscriber thread must exist
       new_thread = @bus.instance_variable_get(:@subscriber_thread)
       new_thread.wont_be_nil
+      wait_for(2000) { new_thread.alive? }
       new_thread.alive?.must_equal true
+
+      # The old keepalive blk must NOT have re-queued itself — the new thread
+      # registers its own blk. Two competing blks would cause double recoveries.
+      wait_for(2000) { @bus.timer.jobs.length == 1 }
+      @bus.timer.jobs.length.must_equal 1
     end
 
     it "logs a warning when keepalive times out" do
@@ -485,6 +494,31 @@ describe MessageBus do
       replacement.kill
       # original_thread is still running the stub loop; kill it for cleanup
       original_thread.kill
+    end
+
+    it "does not trigger recovery when @last_message is nil (treated as now)" do
+      # nil @last_message falls back to Time.now via (@last_message || Time.now),
+      # so the elapsed time is ~0 and the timeout threshold is never crossed.
+      @bus.instance_variable_set(:@last_message, nil)
+      original_thread = @bus.instance_variable_get(:@subscriber_thread)
+
+      trigger_keepalive_blk
+
+      original_thread.alive?.must_equal true
+      # The blk must re-queue itself (healthy path), not stop
+      wait_for(2000) { @bus.timer.jobs.length == 1 }
+      @bus.timer.jobs.length.must_equal 1
+    end
+
+    it "does not attempt recovery when the bus is destroyed" do
+      original_thread = @bus.instance_variable_get(:@subscriber_thread)
+      stale_last_message
+      @bus.instance_variable_set(:@destroyed, true)
+
+      trigger_keepalive_blk
+
+      # The blk exits early on @destroyed — no new thread should be spawned
+      @bus.instance_variable_get(:@subscriber_thread).must_equal original_thread
     end
   end
 end
