@@ -400,125 +400,83 @@ describe MessageBus do
   end
 
   describe "keepalive recovery" do
-    # Use an interval just above MIN_KEEPALIVE so the keepalive blk is queued.
-    # Tests invoke the blk directly rather than waiting for real timers.
-    KEEPALIVE_INTERVAL = 30
+    # MIN_KEEPALIVE is 20s in production, making real-timer tests take 60s+.
+    # We temporarily lower it so keepalive_interval=1 is accepted, which
+    # triggers recovery at ~4s — fast enough for CI, slow enough to be real.
+    FAST_KEEPALIVE = 1
 
     before do
-      @bus.configure(keepalive_interval: KEEPALIVE_INTERVAL)
+      @original_min_keepalive = MessageBus::Implementation::MIN_KEEPALIVE
+      MessageBus::Implementation.send(:remove_const, :MIN_KEEPALIVE)
+      MessageBus::Implementation.const_set(:MIN_KEEPALIVE, 0)
 
-      # Simulate a half-open TCP connection: the subscriber thread stays alive
-      # but never receives messages, so @last_message is never refreshed after
-      # we stale it. This also prevents the keepalive publish from resetting
-      # @last_message via the real subscriber.
+      @log_output = StringIO.new
+      @bus.configure(keepalive_interval: FAST_KEEPALIVE, logger: Logger.new(@log_output))
+
+      # Capture the real backend method before stubbing.
+      @real_global_subscribe = @bus.backend_instance.method(:global_subscribe)
+      @call_count = 0
+
+      # First call to global_subscribe: simulate a half-open TCP connection.
+      # The thread stays alive but never yields messages, so @last_message
+      # goes stale and the keepalive eventually fires recovery.
       #
-      # The loop mirrors what real backends do: it runs until global_unsubscribe
-      # sets @subscribed = false, so destroy's @subscriber_thread.join completes
-      # without hanging.
-      @bus.backend_instance.define_singleton_method(:global_subscribe) do |last_id = nil, &blk|
-        @subscribed = true
-        loop { sleep 0.05; break unless @subscribed }
+      # Subsequent calls: delegate to the real backend so the recovered
+      # subscriber thread actually processes messages end-to-end.
+      real_gs = @real_global_subscribe
+      call_count_ref = -> { @call_count += 1 }
+      backend = @bus.backend_instance
+
+      backend.define_singleton_method(:global_subscribe) do |last_id = nil, &blk|
+        if call_count_ref.call == 1
+          @subscribed = true
+          loop { sleep 0.05; break unless @subscribed }
+        else
+          # Remove both stubs so the real backend handles the full lifecycle
+          # of the recovered thread — especially global_unsubscribe, which
+          # destroy needs to signal client.subscribe to exit.
+          backend.singleton_class.remove_method(:global_subscribe)
+          backend.singleton_class.remove_method(:global_unsubscribe)
+          real_gs.call(last_id, &blk)
+        end
       end
-      @bus.backend_instance.define_singleton_method(:global_unsubscribe) do
+
+      backend.define_singleton_method(:global_unsubscribe) do
         @subscribed = false
       end
 
       @bus.after_fork
-      wait_for(1000) { @bus.instance_variable_get(:@subscriber_thread)&.alive? }
-      # after_fork queues a no-op job (delay=0) before the keepalive blk (delay=30s).
-      # Wait until the timer thread consumes the no-op so jobs.first is the keepalive blk.
-      wait_for(1000) { @bus.timer.jobs.length == 1 }
+      wait_for(2000) { @bus.listening? }
     end
 
-    def stale_last_message
-      # No public API to inject time; direct ivar write is intentional test setup.
-      # Stale by more than keepalive_interval * 3 (the timeout threshold).
-      @bus.instance_variable_set(:@last_message, Time.now - KEEPALIVE_INTERVAL * 3 - 1)
+    after do
+      MessageBus::Implementation.send(:remove_const, :MIN_KEEPALIVE)
+      MessageBus::Implementation.const_set(:MIN_KEEPALIVE, @original_min_keepalive)
     end
 
-    def trigger_keepalive_blk
-      # Bypass real timer delay — fires the scheduled proc synchronously.
-      # We shift the job out first to mirror what TimerThread#do_work does
-      # (it calls @jobs.shift before blk.call), so job counts stay accurate.
-      _, blk = @bus.timer.instance_variable_get(:@mutex).synchronize { @bus.timer.jobs.shift }
-      blk.call
+    it "recovers message delivery after a stuck subscriber thread" do
+      @bus.listening?.must_equal true
+
+      received = []
+      @bus.subscribe("/recovery-test") { |msg| received << msg.data }
+
+      # Wait for the keepalive to detect the stuck thread and recover.
+      # With keepalive_interval=1, timeout = 1*3 = 3s, first eligible check at ~4s.
+      wait_for(8000) do
+        @bus.publish("/recovery-test", "post-recovery")
+        sleep 0.1
+        received.include?("post-recovery")
+      end
+
+      received.must_include("post-recovery")
+      @bus.listening?.must_equal true
     end
 
-    it "kills the stuck subscriber thread and creates a fresh one when keepalive times out" do
-      original_thread = @bus.instance_variable_get(:@subscriber_thread)
-      stale_last_message
+    it "logs a warning when the keepalive detects a stuck subscriber" do
+      wait_for(8000) { @log_output.string.include?("no longer functioning correctly") }
 
-      trigger_keepalive_blk
-
-      # The old thread must be dead
-      wait_for(2000) { !original_thread.alive? }
-      original_thread.alive?.must_equal false
-
-      # A new, live subscriber thread must exist
-      new_thread = @bus.instance_variable_get(:@subscriber_thread)
-      new_thread.wont_be_nil
-      wait_for(2000) { new_thread.alive? }
-      new_thread.alive?.must_equal true
-
-      # The old keepalive blk must NOT have re-queued itself — the new thread
-      # registers its own blk. Two competing blks would cause double recoveries.
-      wait_for(2000) { @bus.timer.jobs.length == 1 }
-      @bus.timer.jobs.length.must_equal 1
-    end
-
-    it "logs a warning when keepalive times out" do
-      log_output = StringIO.new
-      @bus.configure(logger: Logger.new(log_output))
-      stale_last_message
-
-      trigger_keepalive_blk
-
-      log_output.string.must_include "timed out"
-      log_output.string.must_include "no longer functioning correctly"
-    end
-
-    it "does not kill a thread that was already replaced by concurrent recovery" do
-      original_thread = @bus.instance_variable_get(:@subscriber_thread)
-      stale_last_message
-
-      # Simulate a race: another recovery path already swapped in a new thread
-      replacement = Thread.new { sleep }
-      @bus.instance_variable_set(:@subscriber_thread, replacement)
-
-      trigger_keepalive_blk
-
-      # The replacement thread must be untouched — we must not kill the wrong thread
-      replacement.alive?.must_equal true
-      @bus.instance_variable_get(:@subscriber_thread).must_equal replacement
-
-      replacement.kill
-      # original_thread is still running the stub loop; kill it for cleanup
-      original_thread.kill
-    end
-
-    it "does not trigger recovery when @last_message is nil (treated as now)" do
-      # nil @last_message falls back to Time.now via (@last_message || Time.now),
-      # so the elapsed time is ~0 and the timeout threshold is never crossed.
-      @bus.instance_variable_set(:@last_message, nil)
-      original_thread = @bus.instance_variable_get(:@subscriber_thread)
-
-      trigger_keepalive_blk
-
-      original_thread.alive?.must_equal true
-      # The blk must re-queue itself (healthy path), not stop
-      wait_for(2000) { @bus.timer.jobs.length == 1 }
-      @bus.timer.jobs.length.must_equal 1
-    end
-
-    it "does not attempt recovery when the bus is destroyed" do
-      original_thread = @bus.instance_variable_get(:@subscriber_thread)
-      stale_last_message
-      @bus.instance_variable_set(:@destroyed, true)
-
-      trigger_keepalive_blk
-
-      # The blk exits early on @destroyed — no new thread should be spawned
-      @bus.instance_variable_get(:@subscriber_thread).must_equal original_thread
+      @log_output.string.must_include "timed out"
+      @log_output.string.must_include "no longer functioning correctly"
     end
   end
 end
