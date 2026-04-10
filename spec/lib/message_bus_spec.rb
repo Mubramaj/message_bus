@@ -402,7 +402,7 @@ describe MessageBus do
   describe "keepalive recovery" do
     # MIN_KEEPALIVE is 20s in production, making real-timer tests take 60s+.
     # We temporarily lower it so keepalive_interval=1 is accepted, which
-    # triggers recovery at ~4s — fast enough for CI, slow enough to be real.
+    # triggers recovery at ~4s fast enough for CI, slow enough to be real.
     FAST_KEEPALIVE = 1
 
     before do
@@ -433,7 +433,7 @@ describe MessageBus do
           loop { sleep 0.05; break unless @subscribed }
         else
           # Remove both stubs so the real backend handles the full lifecycle
-          # of the recovered thread — especially global_unsubscribe, which
+          # of the recovered thread especially global_unsubscribe, which
           # destroy needs to signal client.subscribe to exit.
           backend.singleton_class.remove_method(:global_subscribe)
           backend.singleton_class.remove_method(:global_unsubscribe)

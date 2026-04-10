@@ -762,7 +762,7 @@ module MessageBus::Implementation
             end
           end
           ensure_subscriber_thread
-          # The new thread sets up its own keepalive blk — stop re-queuing this one.
+          # The new thread sets up its own keepalive blk stop re-queuing this one.
         else
           timer.queue(keepalive_interval, &blk) if keepalive_interval > MIN_KEEPALIVE
         end
