@@ -60,6 +60,7 @@ module MessageBus
         @flush_backlog_thread = nil
         @pub_redis = nil
         @subscribed = false
+        @subscriber_connection = nil
         # after 7 days inactive backlogs will be removed
         @max_backlog_age = 604_800
       end
@@ -286,7 +287,7 @@ LUA
           end
 
         begin
-          global_redis = new_redis_connection
+          global_redis = @subscriber_connection = new_redis_connection
 
           clear_backlog.call(&blk) if highest_id
 
@@ -327,7 +328,13 @@ LUA
           retry
         ensure
           global_redis&.disconnect!
+          @subscriber_connection = nil
         end
+      end
+
+      # (see Base#request_reconnect)
+      def request_reconnect
+        @subscriber_connection&.disconnect!
       end
 
       private

@@ -175,6 +175,12 @@ module MessageBus
         raise ConcreteClassMustImplementError
       end
 
+      # Closes the subscriber's connection so its blocked read returns an error
+      # and the backend's own rescue/retry re-establishes it cooperatively.
+      # Backends that cannot get a stuck connection may leave this as a no-op.
+      def request_reconnect
+      end
+
       # Subscribe to messages on all channels. Each message since the last ID
       # specified will be delivered by yielding to the passed block as soon as
       # it is available. This will block until subscription is terminated.
