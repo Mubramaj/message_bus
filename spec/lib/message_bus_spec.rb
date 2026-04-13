@@ -400,10 +400,8 @@ describe MessageBus do
   end
 
   describe "keepalive recovery" do
-    # MIN_KEEPALIVE is 20s in production, making real-timer tests take 60s+.
-    # We temporarily lower it so keepalive_interval=1 is accepted, which
-    # triggers recovery at ~4s fast enough for CI, slow enough to be real.
-    FAST_KEEPALIVE = 1
+    # Lower MIN_KEEPALIVE to 0 so a sub-second keepalive_interval is accepted.
+    FAST_KEEPALIVE = 0.5
 
     before do
       @original_min_keepalive = MessageBus::Implementation::MIN_KEEPALIVE
@@ -413,40 +411,35 @@ describe MessageBus do
       @log_output = StringIO.new
       @bus.configure(keepalive_interval: FAST_KEEPALIVE, logger: Logger.new(@log_output))
 
-      # Capture the real backend method before stubbing.
-      @real_global_subscribe = @bus.backend_instance.method(:global_subscribe)
-      @call_count = 0
-
-      # First call to global_subscribe: simulate a half-open TCP connection.
-      # The thread stays alive but never yields messages, so @last_message
-      # goes stale and the keepalive eventually fires recovery.
-      #
-      # Subsequent calls: delegate to the real backend so the recovered
-      # subscriber thread actually processes messages end-to-end.
-      real_gs = @real_global_subscribe
-      call_count_ref = -> { @call_count += 1 }
+      # Capture before stubbing so each test can expose it via @real_gs.
+      # Setting @real_gs = nil in a test skips entering the real backend after
+      # recovery (used by the "logs a warning" test to avoid a Postgres-specific
+      # teardown race: if LISTEN hasn't been established yet when destroy calls
+      # global_unsubscribe, the pg_notify is silently dropped and join hangs).
+      @real_gs = @bus.backend_instance.method(:global_subscribe)
       backend = @bus.backend_instance
+      reconnect_requested = false
+      test_ctx = self
 
-      backend.define_singleton_method(:global_subscribe) do |last_id = nil, &blk|
-        if call_count_ref.call == 1
-          @subscribed = true
-          loop { sleep 0.05; break unless @subscribed }
-        else
-          # Remove both stubs so the real backend handles the full lifecycle
-          # of the recovered thread especially global_unsubscribe, which
-          # destroy needs to signal client.subscribe to exit.
-          backend.singleton_class.remove_method(:global_subscribe)
-          backend.singleton_class.remove_method(:global_unsubscribe)
-          real_gs.call(last_id, &blk)
-        end
+      backend.define_singleton_method(:request_reconnect) do
+        reconnect_requested = true
       end
 
-      backend.define_singleton_method(:global_unsubscribe) do
-        @subscribed = false
+      # Simulate a half-open connection: block without yielding messages so
+      # @last_message goes stale and the keepalive watchdog fires request_reconnect.
+      # The loop also breaks on teardown (!@subscribed) so destroy can join cleanly.
+      backend.define_singleton_method(:global_subscribe) do |last_id = nil, &blk|
+        @subscribed = true
+        loop { sleep 0.05; break if reconnect_requested || !@subscribed }
+
+        backend.singleton_class.remove_method(:global_subscribe)
+        backend.singleton_class.remove_method(:request_reconnect)
+
+        test_ctx.instance_variable_get(:@real_gs)&.call(last_id, &blk) if reconnect_requested && @subscribed
       end
 
       @bus.after_fork
-      wait_for(2000) { @bus.listening? }
+      wait_for(1000) { @bus.listening? }
     end
 
     after do
@@ -454,26 +447,29 @@ describe MessageBus do
       MessageBus::Implementation.const_set(:MIN_KEEPALIVE, @original_min_keepalive)
     end
 
-    it "recovers message delivery after a stuck subscriber thread" do
-      @bus.listening?.must_equal true
+    it "recovers message delivery after a stuck subscriber" do
+      subscriber_thread_before = @bus.instance_variable_get(:@subscriber_thread)
 
       received = []
       @bus.subscribe("/recovery-test") { |msg| received << msg.data }
 
-      # Wait for the keepalive to detect the stuck thread and recover.
-      # With keepalive_interval=1, timeout = 1*3 = 3s, first eligible check at ~4s.
-      wait_for(8000) do
+      wait_for(4000) do
         @bus.publish("/recovery-test", "post-recovery")
-        sleep 0.1
+        sleep 0.05
         received.include?("post-recovery")
       end
 
       received.must_include("post-recovery")
       @bus.listening?.must_equal true
+      @bus.instance_variable_get(:@subscriber_thread).must_equal subscriber_thread_before
     end
 
     it "logs a warning when the keepalive detects a stuck subscriber" do
-      wait_for(8000) { @log_output.string.include?("no longer functioning correctly") }
+      # Don't enter the real backend after recovery: the thread exits after the
+      # stuck loop, so destroy can join it immediately with no LISTEN/UNSUB race.
+      @real_gs = nil
+
+      wait_for(4000) { @log_output.string.include?("no longer functioning correctly") }
 
       @log_output.string.must_include "timed out"
       @log_output.string.must_include "no longer functioning correctly"
