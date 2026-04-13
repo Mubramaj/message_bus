@@ -180,6 +180,10 @@ module MessageBus
           sync { @listening_on.clear }
         end
 
+        def close_subscribe_connection
+          @subscribe_connection&.close
+        end
+
         private
 
         def exec_prepared(conn, *a)
@@ -376,6 +380,11 @@ module MessageBus
       def global_unsubscribe
         client.publish(postgresql_channel_name, UNSUB_MESSAGE)
         @subscribed = false
+      end
+
+      # (see Base#request_reconnect)
+      def request_reconnect
+        client.close_subscribe_connection
       end
 
       # (see Base#global_subscribe)
