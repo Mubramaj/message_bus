@@ -517,6 +517,7 @@ describe MessageBus do
 
     it "resets @last_message so the watchdog does not cascade during reconnect" do
       reconnect_count = 0
+      stall_exited = false
       backend = @bus.backend_instance
       real_gs = backend.method(:global_subscribe)
 
@@ -526,10 +527,11 @@ describe MessageBus do
 
       backend.define_singleton_method(:global_subscribe) do |last_id = nil, &blk|
         @subscribed = true
-        loop { sleep 0.05; break if reconnect_count > 0 || !@subscribed }
+        loop { sleep 0.001; break if reconnect_count > 0 || !@subscribed }
         backend.singleton_class.remove_method(:global_subscribe)
         backend.singleton_class.remove_method(:request_reconnect)
         @subscribed = false
+        stall_exited = true
         real_gs.call(last_id, &blk) if reconnect_count > 0
       end
 
@@ -542,12 +544,17 @@ describe MessageBus do
       sleep(FAST_KEEPALIVE * 3)
 
       reconnect_count.must_equal 1
+
+      # Ensure real subscriber's Queue is in @listeners before teardown.
+      wait_for(2000) { stall_exited }
+      wait_for(2000) { @bus.backend_instance.subscribed }
     end
 
     it "does not crash the timer thread when request_reconnect raises" do
       backend = @bus.backend_instance
       real_gs = backend.method(:global_subscribe)
       error_raised = false
+      stall_exited = false
 
       backend.define_singleton_method(:request_reconnect) do
         error_raised = true
@@ -555,14 +562,14 @@ describe MessageBus do
       end
 
       # The IOError is raised in the timer thread and caught by its on_error
-      # handler. The subscriber loop still exits via error_raised flag because
-      # the assignment happens before the raise.
+      # handler. The subscriber loop exits via error_raised (set before raise).
       backend.define_singleton_method(:global_subscribe) do |last_id = nil, &blk|
         @subscribed = true
-        loop { sleep 0.05; break if error_raised || !@subscribed }
+        loop { sleep 0.001; break if error_raised || !@subscribed }
         backend.singleton_class.remove_method(:global_subscribe)
         backend.singleton_class.remove_method(:request_reconnect)
         @subscribed = false
+        stall_exited = true
         real_gs.call(last_id, &blk)
       end
 
@@ -571,6 +578,12 @@ describe MessageBus do
 
       # Timer on_error logs "Failed to process job: <error message>"
       wait_for(4000) { @log_output.string.include?("Failed to process job") }
+
+      # Wait for the real subscriber's Queue to be in @listeners before the
+      # test ends. Without this, @bus.destroy (in after) races with Queue
+      # setup and global_unsubscribe's push(nil) becomes a no-op, hanging join.
+      wait_for(2000) { stall_exited }
+      wait_for(2000) { @bus.backend_instance.subscribed }
 
       @bus.listening?.must_equal true
       @log_output.string.must_include "simulated connection error"
