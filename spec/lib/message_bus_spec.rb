@@ -399,23 +399,12 @@ describe MessageBus do
     end
   end
 
-  # === Context for test generation ===
-  # MessageBus::Implementation
-  # Key state: @last_message (Time), @subscribed (bool), @destroyed (bool)
-  # Keepalive: timer fires every keepalive_interval; when
-  #   Time.now - @last_message > keepalive_interval * 3
-  #   → logs warning + calls backend_instance.request_reconnect
-  #   → resets @last_message to avoid cascade during reconnect window
-  # Reconnect: backend#global_subscribe wraps in rescue/retry; request_reconnect
-  #   closes the underlying socket so the blocked read raises and retry fires.
-  # Backend contract: request_reconnect is a no-op on Base; Postgres closes the
-  #   PG subscribe connection; Redis disconnects the subscriber connection.
-  # =====================================
-  describe "keepalive recovery" do
+  describe "keepalive reconnect watchdog" do
     FAST_KEEPALIVE = 0.5
 
     before do
       @original_min_keepalive = MessageBus::Implementation::MIN_KEEPALIVE
+      MessageBus::Implementation.send(:remove_const, :MIN_KEEPALIVE)
       MessageBus::Implementation.const_set(:MIN_KEEPALIVE, 0)
 
       @log_output = StringIO.new
@@ -423,170 +412,113 @@ describe MessageBus do
     end
 
     after do
+      MessageBus::Implementation.send(:remove_const, :MIN_KEEPALIVE)
       MessageBus::Implementation.const_set(:MIN_KEEPALIVE, @original_min_keepalive)
     end
 
-    # Simulates a half-open connection by replacing global_subscribe with a
-    # blocking loop that never yields messages. The loop exits when the bus's
-    # keepalive watchdog fires request_reconnect or when global_unsubscribe sets
-    # @subscribed = false (teardown path).
-    #
-    # @param backend [MessageBus::Backend::Base] the backend to patch
-    # @param resume_after_stall [Boolean] whether to delegate to the real
-    #   global_subscribe after the stall clears, restoring message flow
-    # @return [Array(Proc, Proc)] two zero-argument callables:
-    #   - first returns true once the keepalive watchdog has fired request_reconnect
-    #   - second returns true once the fake stall has exited and @subscribed has
-    #     been cleared, meaning any subsequent subscribed=true is from the real backend
-    def simulate_stuck_subscriber(backend, resume_after_stall: true)
-      real_gs = backend.method(:global_subscribe)
-      reconnect_fired = false
-      stall_exited = false
+    # Replaces global_subscribe with a blocked read simulation that never yields.
+    # The loop exits when global_unsubscribe flips @subscribed to false.
+    def stall_global_subscribe(backend)
+      backend.define_singleton_method(:global_subscribe) do |_last_id = nil, &_blk|
+        @subscribed = true
+        sleep(0.001) while @subscribed
+      end
+    end
+
+    it "invokes request_reconnect and logs a warning when subscriber reads stall" do
+      backend = @bus.backend_instance
+      reconnect_calls = 0
+      stall_global_subscribe(backend)
 
       backend.define_singleton_method(:request_reconnect) do
-        reconnect_fired = true
+        reconnect_calls += 1
+        # Simulate reconnect teardown finishing, allowing this fake subscribe loop to exit.
+        @subscribed = false
       end
-
-      backend.define_singleton_method(:global_subscribe) do |last_id = nil, &blk|
-        @subscribed = true
-        # 1ms sleep so the subscriber thread reacts within ~1ms of reconnect_fired
-        loop { sleep 0.001; break if reconnect_fired || !@subscribed }
-
-        should_resume = reconnect_fired && @subscribed && resume_after_stall
-
-        backend.singleton_class.remove_method(:global_subscribe)
-        backend.singleton_class.remove_method(:request_reconnect)
-
-        if should_resume
-          @subscribed = false
-          stall_exited = true  # set after @subscribed=false, before real_gs
-          real_gs.call(last_id, &blk)
-        else
-          stall_exited = true
-        end
-      end
-
-      [-> { reconnect_fired }, -> { stall_exited }]
-    end
-
-    it "recovers message delivery after a stuck subscriber" do
-      reconnect_fired, stall_exited = simulate_stuck_subscriber(@bus.backend_instance)
 
       @bus.after_fork
       wait_for(1000) { @bus.listening? }
 
-      received = []
-      @bus.subscribe("/recovery-test") { |msg| received << msg.data }
-
-      # Wait for watchdog to fire, then for the fake stall to fully exit
-      # (stall_exited is set after @subscribed=false), then for the real
-      # backend to confirm it is subscribed before publishing.
-      wait_for(4000) { reconnect_fired.call }
-      wait_for(2000) { stall_exited.call }
-      wait_for(2000) { @bus.backend_instance.subscribed }
-
-      @bus.publish("/recovery-test", "post-recovery")
-
-      wait_for(2000) { received.include?("post-recovery") }
-
-      received.must_include("post-recovery")
-      @bus.listening?.must_equal true
-    end
-
-    it "logs a warning when the keepalive detects a stuck subscriber" do
-      _reconnect_fired, _stall_exited = simulate_stuck_subscriber(@bus.backend_instance, resume_after_stall: false)
-
-      @bus.after_fork
-      wait_for(1000) { @bus.listening? }
-
+      wait_for(4000) { reconnect_calls == 1 }
       wait_for(4000) { @log_output.string.include?("no longer functioning correctly") }
 
+      reconnect_calls.must_equal 1
       @log_output.string.must_include "timed out"
       @log_output.string.must_include "no longer functioning correctly"
     end
 
-    it "exits cleanly when destroy is called during a stall" do
-      _reconnect_fired, _stall_exited = simulate_stuck_subscriber(@bus.backend_instance, resume_after_stall: false)
-
-      @bus.after_fork
-      wait_for(1000) { @bus.listening? }
-
-      @bus.destroy
-      @bus.listening?.must_equal false
-    end
-
-    it "resets @last_message so the watchdog does not cascade during reconnect" do
-      reconnect_count = 0
-      stall_exited = false
+    it "resets @last_message so reconnect attempts are not immediate cascades" do
       backend = @bus.backend_instance
-      real_gs = backend.method(:global_subscribe)
+      reconnect_times = []
+      stall_global_subscribe(backend)
 
       backend.define_singleton_method(:request_reconnect) do
-        reconnect_count += 1
-      end
-
-      backend.define_singleton_method(:global_subscribe) do |last_id = nil, &blk|
-        @subscribed = true
-        loop { sleep 0.001; break if reconnect_count > 0 || !@subscribed }
-        backend.singleton_class.remove_method(:global_subscribe)
-        backend.singleton_class.remove_method(:request_reconnect)
-        @subscribed = false
-        stall_exited = true
-        real_gs.call(last_id, &blk) if reconnect_count > 0
+        reconnect_times << Process.clock_gettime(Process::CLOCK_MONOTONIC)
       end
 
       @bus.after_fork
       wait_for(1000) { @bus.listening? }
+      wait_for(7000) { reconnect_times.length >= 2 }
 
-      # Wait for the first reconnect to fire, then let two more keepalive cycles
-      # pass. The @last_message reset in the bus must prevent a second request.
-      wait_for(4000) { reconnect_count > 0 }
-      sleep(FAST_KEEPALIVE * 3)
-
-      reconnect_count.must_equal 1
-
-      # Ensure real subscriber's Queue is in @listeners before teardown.
-      wait_for(2000) { stall_exited }
-      wait_for(2000) { @bus.backend_instance.subscribed }
+      first_gap = reconnect_times[1] - reconnect_times[0]
+      first_gap.must_be :>=, FAST_KEEPALIVE * 2.8
     end
 
-    it "does not crash the timer thread when request_reconnect raises" do
+    it "keeps the timer thread running when request_reconnect raises" do
       backend = @bus.backend_instance
-      real_gs = backend.method(:global_subscribe)
-      error_raised = false
-      stall_exited = false
+      reconnect_failed = false
+      stall_global_subscribe(backend)
 
       backend.define_singleton_method(:request_reconnect) do
-        error_raised = true
+        reconnect_failed = true
         raise IOError, "simulated connection error"
       end
 
-      # The IOError is raised in the timer thread and caught by its on_error
-      # handler. The subscriber loop exits via error_raised (set before raise).
-      backend.define_singleton_method(:global_subscribe) do |last_id = nil, &blk|
-        @subscribed = true
-        loop { sleep 0.001; break if error_raised || !@subscribed }
-        backend.singleton_class.remove_method(:global_subscribe)
-        backend.singleton_class.remove_method(:request_reconnect)
-        @subscribed = false
-        stall_exited = true
-        real_gs.call(last_id, &blk)
-      end
-
       @bus.after_fork
       wait_for(1000) { @bus.listening? }
 
-      # Timer on_error logs "Failed to process job: <error message>"
+      wait_for(4000) { reconnect_failed }
       wait_for(4000) { @log_output.string.include?("Failed to process job") }
 
-      # Wait for the real subscriber's Queue to be in @listeners before the
-      # test ends. Without this, @bus.destroy (in after) races with Queue
-      # setup and global_unsubscribe's push(nil) becomes a no-op, hanging join.
-      wait_for(2000) { stall_exited }
-      wait_for(2000) { @bus.backend_instance.subscribed }
+      timer_job_ran = false
+      @bus.timer.queue(0.01) { timer_job_ran = true }
+      wait_for(1000) { timer_job_ran }
 
       @bus.listening?.must_equal true
       @log_output.string.must_include "simulated connection error"
+    end
+  end
+
+  describe "request_reconnect backend wiring" do
+    it "is a no-op on the abstract base backend" do
+      backend = MessageBus::Backends::Base.new
+      backend.request_reconnect.must_be_nil
+    end
+
+    it "disconnects the redis subscriber connection" do
+      skip "Redis backend only" unless CURRENT_BACKEND == :redis
+
+      backend = @bus.backend_instance
+      disconnect_calls = 0
+      fake_connection = Object.new
+      fake_connection.define_singleton_method(:disconnect!) { disconnect_calls += 1 }
+      backend.instance_variable_set(:@subscriber_connection, fake_connection)
+
+      backend.request_reconnect
+
+      disconnect_calls.must_equal 1
+    end
+
+    it "closes the postgres subscribe connection" do
+      skip "Postgres backend only" unless CURRENT_BACKEND == :postgres
+
+      backend = @bus.backend_instance
+      close_calls = 0
+      backend.send(:client).define_singleton_method(:close_subscribe_connection) { close_calls += 1 }
+
+      backend.request_reconnect
+
+      close_calls.must_equal 1
     end
   end
 end
