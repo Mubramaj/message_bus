@@ -175,9 +175,15 @@ module MessageBus
         raise ConcreteClassMustImplementError
       end
 
-      # Closes the subscriber's connection so its blocked read returns an error
-      # and the backend's own rescue/retry re-establishes it cooperatively.
-      # Backends that cannot get a stuck connection may leave this as a no-op.
+      # Asks the subscriber to drop its connection and re-establish it, so a
+      # wedged connection (a half-open socket, for example) recovers without a
+      # process restart. The backend's rescue/retry around {#global_subscribe}
+      # performs the actual reconnection.
+      #
+      # Called from the keepalive watchdog thread, never from the subscriber
+      # thread; implementations must not touch anything requiring
+      # single-thread ownership (see the Postgres backend). Backends with no
+      # way to detach a stuck connection may leave this as the inherited no-op.
       def request_reconnect
       end
 

@@ -17,6 +17,10 @@ describe BACKEND_CLASS do
     it "has the same public methods as the base class" do
       @bus.public_methods.sort.must_equal MessageBus::Backends::Base.new(test_config_for_backend(CURRENT_BACKEND)).public_methods.sort
     end
+
+    it "treats request_reconnect as an optional no-op rather than an error" do
+      MessageBus::Backends::Base.new.request_reconnect.must_be_nil
+    end
   end
 
   it "should be able to access the backlog" do
@@ -392,8 +396,16 @@ describe BACKEND_CLASS do
     got.map { |m| m.data }.must_equal ["12"]
   end
 
+  it "tolerates request_reconnect when nothing is subscribed" do
+    @bus.request_reconnect
+
+    @bus.publish("/reconnect-noop", "bar")
+
+    @bus.backlog("/reconnect-noop", 0).map(&:data).must_equal ["bar"]
+  end
+
   it "retries global_subscribe after a redis subscribe failure" do
-    skip "Redis backend only" unless CURRENT_BACKEND == :redis
+    test_only(:redis)
 
     log_output = StringIO.new
     @bus.instance_variable_set(:@logger, Logger.new(log_output))
@@ -437,7 +449,7 @@ describe BACKEND_CLASS do
   end
 
   it "retries global_subscribe after request_reconnect disconnects redis" do
-    skip "Redis backend only" unless CURRENT_BACKEND == :redis
+    test_only(:redis)
 
     log_output = StringIO.new
     @bus.instance_variable_set(:@logger, Logger.new(log_output))
@@ -484,4 +496,102 @@ describe BACKEND_CLASS do
     subscribe_attempts.must_be :>=, 2
   end
 
+  # Records LISTEN attempts and which thread closed each subscriber
+  # connection (pool connections are excluded), and shortens the notify poll
+  # so a reconnect request is picked up quickly.
+  def instrument_postgres_client(backend)
+    recorded = { subscribes: [], close_threads: [] }
+    client = backend.send(:client)
+    real_subscribe = client.method(:subscribe)
+    real_raw_pg_connection = client.method(:raw_pg_connection)
+
+    client.define_singleton_method(:subscribe) do |channel, &blk|
+      recorded[:subscribes] << channel
+      real_subscribe.call(channel, &blk)
+    end
+
+    client.define_singleton_method(:raw_pg_connection) do
+      conn = real_raw_pg_connection.call
+      subscriber = false
+
+      conn.define_singleton_method(:wait_for_notify) do |_timeout = nil, &blk|
+        subscriber = true
+        super(0.05, &blk)
+      end
+
+      conn.define_singleton_method(:close) do
+        recorded[:close_threads] << Thread.current if subscriber
+        super()
+      end
+
+      conn
+    end
+
+    recorded
+  end
+
+  it "reconnects the postgres subscriber from its own thread" do
+    test_only(:postgres)
+
+    log_output = StringIO.new
+    @bus.instance_variable_get(:@config)[:logger] = Logger.new(log_output)
+    recorded = instrument_postgres_client(@bus)
+
+    got = []
+
+    t = Thread.new do
+      @bus.global_subscribe(0) do |msg|
+        got << msg
+      end
+    end
+
+    wait_for(5000) { @bus.subscribed }
+
+    @bus.publish("/pg-reconnect", "before-reconnect")
+    wait_for(3000) { got.any? { |m| m.data == "before-reconnect" } }
+
+    @bus.request_reconnect
+
+    # on.unsubscribe never fires here, so @bus.subscribed can't be used as the signal.
+    wait_for(7000) { recorded[:subscribes].length >= 2 }
+
+    @bus.publish("/pg-reconnect", "after-reconnect")
+    wait_for(5000) { got.any? { |m| m.data == "after-reconnect" } }
+
+    @bus.global_unsubscribe
+    t.join(3)
+    t.kill if t.alive?
+
+    got.map(&:data).must_include "after-reconnect"
+    log_output.string.must_include "subscribe failed, reconnecting in 1 second"
+
+    # Regression check: only the subscriber thread may close its own PGconn.
+    recorded[:close_threads].uniq.must_equal [t]
+  end
+
+  it "ignores a postgres reconnect request made while nothing was subscribed" do
+    test_only(:postgres)
+
+    recorded = instrument_postgres_client(@bus)
+    @bus.request_reconnect
+
+    got = []
+
+    t = Thread.new do
+      @bus.global_subscribe(0) do |msg|
+        got << msg
+      end
+    end
+
+    wait_for(5000) { @bus.subscribed }
+
+    @bus.publish("/pg-stale-reconnect", "delivered")
+    wait_for(3000) { got.any? { |m| m.data == "delivered" } }
+
+    @bus.global_unsubscribe
+    t.join(3)
+    t.kill if t.alive?
+
+    recorded[:subscribes].length.must_equal 1
+  end
 end

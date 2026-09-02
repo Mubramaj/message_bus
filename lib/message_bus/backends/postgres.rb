@@ -20,6 +20,10 @@ module MessageBus
     #
     # @see Base general information about message_bus backends
     class Postgres < Base
+      # Raised inside the subscriber thread to make it drop its LISTEN
+      # connection and reconnect. See {Postgres#request_reconnect}.
+      ReconnectRequested = Class.new(StandardError)
+
       class Client
         INHERITED_CONNECTIONS = []
 
@@ -45,6 +49,7 @@ module MessageBus
           @available = []
           @allocated = {}
           @subscribe_connection = nil
+          @reconnect_requested = false
           @subscribed = false
           @mutex = Mutex.new
           @pid = Process.pid
@@ -153,38 +158,54 @@ module MessageBus
 
         def subscribe(channel)
           obj = Object.new
-          sync { @listening_on[channel] = obj }
+          sync do
+            @listening_on[channel] = obj
+            @reconnect_requested = false
+          end
           listener = Listener.new
           yield listener
 
           conn = @subscribe_connection = raw_pg_connection
-          conn.exec "LISTEN #{channel}"
-          listener.do_sub.call
-          while listening_on?(channel, obj)
-            conn.wait_for_notify(10) do |_, _, payload|
-              break unless listening_on?(channel, obj)
 
-              listener.do_message.call(nil, payload)
+          begin
+            conn.exec "LISTEN #{channel}"
+            listener.do_sub.call
+            while listening_on?(channel, obj)
+              raise ReconnectRequested if reconnect_requested?
+
+              conn.wait_for_notify(10) do |_, _, payload|
+                break unless listening_on?(channel, obj)
+
+                listener.do_message.call(nil, payload)
+              end
             end
-          end
-          listener.do_unsub.call
+            listener.do_unsub.call
 
-          conn.exec "UNLISTEN #{channel}"
-          nil
-        ensure
-          @subscribe_connection&.close
-          @subscribe_connection = nil
+            conn.exec "UNLISTEN #{channel}"
+            nil
+          ensure
+            @subscribe_connection&.close
+            @subscribe_connection = nil
+          end
         end
 
         def unsubscribe
           sync { @listening_on.clear }
         end
 
-        def close_subscribe_connection
-          @subscribe_connection&.close
+        # Sets a flag rather than closing the connection directly, since only
+        # the owning thread may touch a PGconn. Picked up by {#subscribe}'s
+        # wait_for_notify loop, which raises to trigger the retry in
+        # {Postgres#global_subscribe}.
+        def request_reconnect
+          sync { @reconnect_requested = true }
         end
 
         private
+
+        def reconnect_requested?
+          sync { @reconnect_requested }
+        end
 
         def exec_prepared(conn, *a)
           r = conn.exec_prepared(*a)
@@ -383,8 +404,13 @@ module MessageBus
       end
 
       # (see Base#request_reconnect)
+      #
+      # Flags the subscriber thread instead of closing its connection: a
+      # PG::Connection may only be used by its owning thread. The reconnect
+      # therefore takes effect when the subscriber's `wait_for_notify` call
+      # next returns, so within 10 seconds.
       def request_reconnect
-        client.close_subscribe_connection
+        client.request_reconnect
       end
 
       # (see Base#global_subscribe)
