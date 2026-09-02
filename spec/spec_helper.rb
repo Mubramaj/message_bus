@@ -19,7 +19,9 @@ BACKEND_CLASS = MessageBus::BACKENDS.fetch(CURRENT_BACKEND)
 puts "Running with backend: #{CURRENT_BACKEND}"
 
 def test_only(*backends)
-  skip "Test doesn't apply to #{CURRENT_BACKEND}" if backends.exclude?(CURRENT_BACKEND)
+  return if backends.include?(CURRENT_BACKEND)
+
+  skip "Test doesn't apply to #{CURRENT_BACKEND}"
 end
 
 def test_never(*backends)

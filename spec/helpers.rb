@@ -23,7 +23,7 @@ def test_config_for_backend(backend)
 
   case backend
   when :redis
-    config[:url] = ENV['REDISURL']
+    config[:redis_config] = { url: ENV['REDISURL'] }
   when :postgres
     config[:backend_options] = {
       host: ENV['PGHOST'],
