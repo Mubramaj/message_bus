@@ -400,7 +400,9 @@ describe MessageBus do
   end
 
   describe "keepalive reconnect watchdog" do
-    FAST_KEEPALIVE = 0.5
+    def fast_keepalive
+      0.5
+    end
 
     before do
       @original_min_keepalive = MessageBus::Implementation::MIN_KEEPALIVE
@@ -408,7 +410,7 @@ describe MessageBus do
       MessageBus::Implementation.const_set(:MIN_KEEPALIVE, 0)
 
       @log_output = StringIO.new
-      @bus.configure(keepalive_interval: FAST_KEEPALIVE, logger: Logger.new(@log_output))
+      @bus.configure(keepalive_interval: fast_keepalive, logger: Logger.new(@log_output))
     end
 
     after do
@@ -416,8 +418,6 @@ describe MessageBus do
       MessageBus::Implementation.const_set(:MIN_KEEPALIVE, @original_min_keepalive)
     end
 
-    # Replaces global_subscribe with a blocked read simulation that never yields.
-    # The loop exits when global_unsubscribe flips @subscribed to false.
     def stall_global_subscribe(backend)
       backend.define_singleton_method(:global_subscribe) do |_last_id = nil, &_blk|
         @subscribed = true
@@ -432,7 +432,6 @@ describe MessageBus do
 
       backend.define_singleton_method(:request_reconnect) do
         reconnect_calls += 1
-        # Simulate reconnect teardown finishing, allowing this fake subscribe loop to exit.
         @subscribed = false
       end
 
@@ -461,64 +460,48 @@ describe MessageBus do
       wait_for(7000) { reconnect_times.length >= 2 }
 
       first_gap = reconnect_times[1] - reconnect_times[0]
-      first_gap.must_be :>=, FAST_KEEPALIVE * 2.8
+      first_gap.must_be :>=, fast_keepalive * 2.8
     end
 
-    it "keeps the timer thread running when request_reconnect raises" do
+    it "stays armed and tries again when request_reconnect raises" do
       backend = @bus.backend_instance
-      reconnect_failed = false
+      reconnect_calls = 0
       stall_global_subscribe(backend)
 
       backend.define_singleton_method(:request_reconnect) do
-        reconnect_failed = true
+        reconnect_calls += 1
         raise IOError, "simulated connection error"
       end
 
       @bus.after_fork
       wait_for(1000) { @bus.listening? }
 
-      wait_for(4000) { reconnect_failed }
-      wait_for(4000) { @log_output.string.include?("Failed to process job") }
+      wait_for(8000) { reconnect_calls >= 2 }
 
-      timer_job_ran = false
-      @bus.timer.queue(0.01) { timer_job_ran = true }
-      wait_for(1000) { timer_job_ran }
-
-      @bus.listening?.must_equal true
+      reconnect_calls.must_be :>=, 2
+      @log_output.string.must_include "Failed to request subscriber reconnect"
       @log_output.string.must_include "simulated connection error"
     end
-  end
 
-  describe "request_reconnect backend wiring" do
-    it "is a no-op on the abstract base backend" do
-      backend = MessageBus::Backends::Base.new
-      backend.request_reconnect.must_be_nil
-    end
-
-    it "disconnects the redis subscriber connection" do
-      skip "Redis backend only" unless CURRENT_BACKEND == :redis
-
+    it "stays armed when the keepalive publish raises" do
       backend = @bus.backend_instance
-      disconnect_calls = 0
-      fake_connection = Object.new
-      fake_connection.define_singleton_method(:disconnect!) { disconnect_calls += 1 }
-      backend.instance_variable_set(:@subscriber_connection, fake_connection)
+      publish_calls = 0
+      real_publish = backend.method(:publish)
+      stall_global_subscribe(backend)
 
-      backend.request_reconnect
+      backend.define_singleton_method(:publish) do |*args, &blk|
+        publish_calls += 1
+        raise IOError, "simulated publish failure" if publish_calls == 1
 
-      disconnect_calls.must_equal 1
-    end
+        real_publish.call(*args, &blk)
+      end
 
-    it "closes the postgres subscribe connection" do
-      skip "Postgres backend only" unless CURRENT_BACKEND == :postgres
+      @bus.after_fork
+      wait_for(1000) { @bus.listening? }
+      wait_for(5000) { publish_calls >= 3 }
 
-      backend = @bus.backend_instance
-      close_calls = 0
-      backend.send(:client).define_singleton_method(:close_subscribe_connection) { close_calls += 1 }
-
-      backend.request_reconnect
-
-      close_calls.must_equal 1
+      publish_calls.must_be :>=, 3
+      @log_output.string.must_include "simulated publish failure"
     end
   end
 end

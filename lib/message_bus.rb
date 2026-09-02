@@ -748,18 +748,26 @@ module MessageBus::Implementation
 
     blk = proc do
       if !@destroyed && thread.alive? && keepalive_interval > MIN_KEEPALIVE
+        begin
+          publish("/__mb_keepalive__/", Process.pid, user_ids: [-1])
 
-        publish("/__mb_keepalive__/", Process.pid, user_ids: [-1])
-        if (Time.now - (@last_message || Time.now)) > keepalive_interval * 3
-          logger.warn "Global messages on #{Process.pid} timed out, message bus is no longer functioning correctly"
-          # Close the subscriber connection cooperatively so the blocked read
-          # errors and the backend's rescue/retry reconnects on a fresh socket.
-          # Reset @last_message to avoid cascade-triggering during the 1s reconnect window.
-          @last_message = Time.now
-          backend_instance.request_reconnect
+          if (Time.now - (@last_message || Time.now)) > keepalive_interval * 3
+            logger.warn "Global messages on #{Process.pid} timed out, message bus is no longer functioning correctly"
+
+            # Reset first so a slow reconnect isn't re-triggered on the next tick.
+            @last_message = Time.now
+
+            begin
+              backend_instance.request_reconnect
+            rescue => e
+              logger.warn "Failed to request subscriber reconnect on #{Process.pid}: #{e}"
+            end
+          end
+        ensure
+          # This proc is the only thing that re-schedules itself; an exception
+          # escaping here would disable the watchdog permanently.
+          timer.queue(keepalive_interval, &blk) if keepalive_interval > MIN_KEEPALIVE
         end
-
-        timer.queue(keepalive_interval, &blk) if keepalive_interval > MIN_KEEPALIVE
       end
     end
 
