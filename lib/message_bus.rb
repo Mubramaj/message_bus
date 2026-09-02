@@ -752,6 +752,11 @@ module MessageBus::Implementation
         publish("/__mb_keepalive__/", Process.pid, user_ids: [-1])
         if (Time.now - (@last_message || Time.now)) > keepalive_interval * 3
           logger.warn "Global messages on #{Process.pid} timed out, message bus is no longer functioning correctly"
+          # Close the subscriber connection cooperatively so the blocked read
+          # errors and the backend's rescue/retry reconnects on a fresh socket.
+          # Reset @last_message to avoid cascade-triggering during the 1s reconnect window.
+          @last_message = Time.now
+          backend_instance.request_reconnect
         end
 
         timer.queue(keepalive_interval, &blk) if keepalive_interval > MIN_KEEPALIVE

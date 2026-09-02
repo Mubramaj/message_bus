@@ -392,4 +392,96 @@ describe BACKEND_CLASS do
     got.map { |m| m.data }.must_equal ["12"]
   end
 
+  it "retries global_subscribe after a redis subscribe failure" do
+    skip "Redis backend only" unless CURRENT_BACKEND == :redis
+
+    log_output = StringIO.new
+    @bus.instance_variable_set(:@logger, Logger.new(log_output))
+
+    fail_first_subscribe = true
+    real_new_redis_connection = @bus.method(:new_redis_connection)
+
+    @bus.define_singleton_method(:new_redis_connection) do
+      redis = real_new_redis_connection.call
+
+      if fail_first_subscribe
+        fail_first_subscribe = false
+        redis.define_singleton_method(:subscribe) do |_channel, &_blk|
+          raise IOError, "forced subscribe failure"
+        end
+      end
+
+      redis
+    end
+
+    got = []
+
+    t = Thread.new do
+      @bus.global_subscribe(0) do |msg|
+        got << msg
+      end
+    end
+
+    wait_for(4000) { log_output.string.include?("forced subscribe failure") }
+    wait_for(5000) { @bus.subscribed }
+
+    @bus.publish("/redis-retry", "delivered-after-retry")
+    wait_for(3000) { got.any? { |m| m.data == "delivered-after-retry" } }
+
+    @bus.global_unsubscribe
+    t.join(2)
+    t.kill if t.alive?
+
+    log_output.string.must_include "subscribe failed, reconnecting in 1 second"
+    got.map(&:data).must_include "delivered-after-retry"
+  end
+
+  it "retries global_subscribe after request_reconnect disconnects redis" do
+    skip "Redis backend only" unless CURRENT_BACKEND == :redis
+
+    log_output = StringIO.new
+    @bus.instance_variable_set(:@logger, Logger.new(log_output))
+    subscribe_attempts = 0
+    real_new_redis_connection = @bus.method(:new_redis_connection)
+
+    @bus.define_singleton_method(:new_redis_connection) do
+      redis = real_new_redis_connection.call
+      real_subscribe = redis.method(:subscribe)
+      redis.define_singleton_method(:subscribe) do |*args, &blk|
+        subscribe_attempts += 1
+        real_subscribe.call(*args, &blk)
+      end
+      redis
+    end
+
+    got = []
+
+    t = Thread.new do
+      @bus.global_subscribe(0) do |msg|
+        got << msg
+      end
+    end
+
+    wait_for(5000) { @bus.subscribed }
+    wait_for(5000) { subscribe_attempts >= 1 }
+
+    @bus.publish("/redis-reconnect", "before-reconnect")
+    wait_for(3000) { got.any? { |m| m.data == "before-reconnect" } }
+
+    @bus.request_reconnect
+
+    wait_for(7000) { log_output.string.include?("subscribe failed, reconnecting in 1 second") }
+    wait_for(7000) { subscribe_attempts >= 2 }
+
+    @bus.publish("/redis-reconnect", "after-reconnect")
+    wait_for(5000) { got.any? { |m| m.data == "after-reconnect" } }
+
+    @bus.global_unsubscribe
+    t.join(2)
+    t.kill if t.alive?
+
+    got.map(&:data).must_include "after-reconnect"
+    subscribe_attempts.must_be :>=, 2
+  end
+
 end
