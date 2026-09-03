@@ -368,7 +368,7 @@ message_bus can be configured to use one of several available storage backends, 
 
 ### Keepalive
 
-To ensure correct operation of message_bus, every 60 seconds a message is broadcast to itself. If for any reason the message is not consumed by the same process within 3 keepalive intervals a warning log message is raised.
+To ensure correct operation of message_bus, every 60 seconds a message is broadcast to itself. If for any reason the message is not consumed by the same process within 3 keepalive intervals, a warning log message is raised and the backend subscriber is asked to reconnect, so a wedged connection (for example, a half-open socket) can self-heal without a process restart.
 
 To control keepalive interval use
 
