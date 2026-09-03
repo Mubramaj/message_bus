@@ -420,15 +420,18 @@ module MessageBus
         highest_id = last_id
 
         begin
+          # Seed a cursor if we don't already have one, so that a reconnect
+          # (triggered by ReconnectRequested below) always has a replay
+          # point and never treats "no explicit last_id" as "never replay".
+          highest_id ||= client.max_id
+
           client.subscribe(postgresql_channel_name) do |on|
             h = {}
 
             on.subscribe do
-              if highest_id
-                process_global_backlog(highest_id) do |m|
-                  h[m.global_id] = true
-                  yield m
-                end
+              highest_id = process_global_backlog(highest_id) do |m|
+                h[m.global_id] = true
+                yield m
               end
               h = nil if h.empty?
               @subscribed = true
@@ -445,25 +448,19 @@ module MessageBus
               end
               m = MessageBus::Message.decode m
 
-              # we have 3 options
-              #
-              # 1. message came in the correct order GREAT, just deal with it
-              # 2. message came in the incorrect order COMPLICATED, wait a tiny bit and clear backlog
-              # 3. message came in the incorrect order and is lowest than current highest id, reset
+              # If already yielded during the clear backlog when subscribing,
+              # don't yield a duplicate copy.
+              duplicate = h && h.delete(m.global_id)
+              h = nil if h&.empty?
 
-              if h
-                # If already yielded during the clear backlog when subscribing,
-                # don't yield a duplicate copy.
-                unless h.delete(m.global_id)
-                  h = nil if h.empty?
-                  yield m
-                end
-              else
+              unless duplicate
+                highest_id = m.global_id if m.global_id > highest_id
                 yield m
               end
             end
           end
         rescue => error
+          @subscribed = false
           @config[:logger].warn "#{error} subscribe failed, reconnecting in 1 second. Call stack\n#{error.backtrace.join("\n")}"
           sleep 1
           retry
