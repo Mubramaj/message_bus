@@ -289,11 +289,16 @@ LUA
         begin
           global_redis = @subscriber_connection = new_redis_connection
 
-          clear_backlog.call(&blk) if highest_id
+          # Seed a cursor if we don't already have one, so that a reconnect
+          # (triggered by request_reconnect below) always has a replay point
+          # and never treats "no explicit last_id" as "never replay".
+          highest_id ||= current_global_id
+
+          clear_backlog.call(&blk)
 
           global_redis.subscribe(redis_channel_name) do |on|
             on.subscribe do
-              clear_backlog.call(&blk) if highest_id
+              clear_backlog.call(&blk)
               @subscribed = true
             end
 
@@ -313,7 +318,7 @@ LUA
               # 2. message came in the incorrect order COMPLICATED, wait a tiny bit and clear backlog
               # 3. message came in the incorrect order and is lowest than current highest id, reset
 
-              if highest_id.nil? || m.global_id == highest_id + 1
+              if m.global_id == highest_id + 1
                 highest_id = m.global_id
                 yield m
               else
@@ -322,6 +327,7 @@ LUA
             end
           end
         rescue => error
+          @subscribed = false
           @logger.warn "#{error} subscribe failed, reconnecting in 1 second. Call stack #{error.backtrace.join("\n")}"
           sleep 1
           global_redis&.disconnect!
@@ -369,8 +375,12 @@ LUA
         "__mb_global_backlog_n"
       end
 
+      def current_global_id
+        pub_redis.get(global_id_key).to_i
+      end
+
       def process_global_backlog(highest_id, raise_error)
-        highest_id = 0 if highest_id > pub_redis.get(global_id_key).to_i
+        highest_id = 0 if highest_id > current_global_id
 
         global_backlog(highest_id).each do |old|
           if highest_id + 1 == old.global_id
