@@ -591,7 +591,9 @@ module MessageBus::Implementation
 
   # @param [Integer] interval the keepalive interval in seconds.
   #   Set to 0 to disable; anything higher and a keepalive will run every N
-  #   seconds. If it fails, the process is killed.
+  #   seconds. If a keepalive message is not received within 3 intervals, a
+  #   warning is logged and the backend subscriber is asked to reconnect
+  #   (see {Backends::Base#request_reconnect}).
   def keepalive_interval=(interval)
     configure(keepalive_interval: interval)
   end
